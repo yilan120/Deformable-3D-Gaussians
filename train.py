@@ -15,6 +15,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence
 from gaussian_renderer import render, network_gui
 import sys
+import torchvision
 from scene import Scene, GaussianModel, DeformModel
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
@@ -104,6 +105,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        # import ipdb; ipdb.set_trace()
+        # torchvision.utils.save_image(image, "test/iter_{}_image.png".format(iteration))
+        # torchvision.utils.save_image(gt_image, "test/iter_{}_gt_image.png".format(iteration))
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
@@ -117,7 +121,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
+                                          "Point num": f"{gaussians.get_xyz.shape[0]}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -145,10 +150,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 viewspace_point_tensor_densify = render_pkg_re["viewspace_points_densify"]
                 gaussians.add_densification_stats(viewspace_point_tensor_densify, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-
+                    gaussians.densify_and_prune(gaussians.get_xyz.shape[0], opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                # print("gaussians.get_xyz.shape[0]:{}".format(gaussians.get_xyz.shape[0]))
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()

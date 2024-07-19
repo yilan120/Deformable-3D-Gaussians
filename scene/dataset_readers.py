@@ -19,6 +19,7 @@ from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
 import imageio
+import torchvision
 from glob import glob
 import cv2 as cv
 from pathlib import Path
@@ -26,12 +27,14 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
+from torchvision.transforms import ToTensor
 
 
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
     T: np.array
+    K: np.array
     FovY: np.array
     FovX: np.array
     image: np.array
@@ -114,8 +117,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id
-        R = np.transpose(qvec2rotmat(extr.qvec))
-        T = np.array(extr.tvec)
+
+        c2w_R = qvec2rotmat(extr.qvec)
+        c2w_R = np.array(c2w_R)
+        c2w_T = np.array(extr.tvec).reshape(3, 1)
+        c2w = np.eye(4)
+        c2w[:3, :3] = c2w_R
+        c2w[:3, 3:4] = c2w_T
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3,:3])
+        T = w2c[:3, 3]
+
+        # R = np.transpose(qvec2rotmat(extr.qvec))
+        # T = np.array(extr.tvec)
 
         if intr.model == "SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
@@ -129,12 +143,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
+        K = np.array([[focal_length_x, 0, intr.params[2]], [0, focal_length_x, intr.params[3]], [0, 0, 1]]).astype('float32')
+
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        I_image = Image.open(image_path)
+        image = ToTensor()(I_image)
+        mask_path = image_path.replace("HO3D_v2", "HO3D_v2_Segmentations_rendered").replace("images", "object_seg").replace(".png", ".jpg")
+        I_mask = Image.open(mask_path)
+        tensor_single_channel_mask = ToTensor()(I_mask.convert("L"))
+        seg_image = torchvision.transforms.ToPILImage()(image * tensor_single_channel_mask)
 
         fid = int(image_name) / (num_frames - 1)
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=seg_image,
                               image_path=image_path, image_name=image_name, width=width, height=height, fid=fid)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')

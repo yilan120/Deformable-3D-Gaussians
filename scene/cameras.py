@@ -12,11 +12,11 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrix_refine
 
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
+    def __init__(self, colmap_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None):
         super(Camera, self).__init__()
 
@@ -54,8 +54,10 @@ class Camera(nn.Module):
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).to(
             self.data_device)
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
-                                                     fovY=self.FoVy).transpose(0, 1).to(self.data_device)
+        # self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
+        #                                              fovY=self.FoVy).transpose(0, 1).to(self.data_device)
+        self.projection_matrix = getProjectionMatrix_refine(K=torch.Tensor(K).cuda(), H=self.image_height, 
+                                                        W=self.image_width, znear=self.znear, zfar=self.zfar).transpose(0, 1).to(self.data_device)
         self.full_proj_transform = (
             self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]

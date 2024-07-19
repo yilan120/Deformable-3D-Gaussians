@@ -14,12 +14,12 @@ import os
 from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
-from utils.loss_utils import ssim
+from utils.loss_utils import ssim, ssim_mask
 # from lpipsPyTorch import lpips
 import lpips
 import json
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import psnr, psnr_excluding_mask
 from argparse import ArgumentParser
 
 
@@ -35,6 +35,20 @@ def readImages(renders_dir, gt_dir):
         image_names.append(fname)
     return renders, gts, image_names
 
+def readImages_mask(renders_dir, gt_dir, mask_dir):
+    renders = []
+    gts = []
+    masks = []
+    image_names = []
+    for fname in os.listdir(renders_dir):
+        render = Image.open(renders_dir / fname)
+        gt = Image.open(gt_dir / fname)
+        mask = Image.open((mask_dir + '/' + fname[1:]).replace("png", "jpg")).convert("L")
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        masks.append(tf.to_tensor(mask).unsqueeze(0)[:, :1, :, :].cuda())
+        image_names.append(fname)
+    return renders, gts, masks, image_names
 
 def evaluate(model_paths):
     full_dict = {}
@@ -66,7 +80,10 @@ def evaluate(model_paths):
                 method_dir = test_dir / method
                 gt_dir = method_dir / "gt"
                 renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+                mask_dir = "/data/scratch/acw773/HO3D_v2_Segmentations_rendered/train/ABF10/object_seg"
+                # renders, gts, image_names = readImages(renders_dir, gt_dir)
+                renders, gts, masks, image_names = readImages_mask(renders_dir, gt_dir, mask_dir)
+                
 
                 ssims = []
                 psnrs = []
@@ -76,6 +93,13 @@ def evaluate(model_paths):
                     ssims.append(ssim(renders[idx], gts[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+                    # import ipdb; ipdb.set_trace()
+                    # ssims.append(ssim_mask(renders[idx], gts[idx], masks[idx]))
+                    # psnrs.append(psnr_excluding_mask(renders[idx], gts[idx], masks[idx]))
+                    # 不可使用, lpips要求是image的格式, 这种情况下无法比较
+                    # mask_idx = masks[idx] > 0.5
+                    # mask_idx = mask_idx.expand_as(renders[idx])
+                    # lpipss.append(lpips_fn(renders[idx][mask_idx], gts[idx][mask_idx]).detach())
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
