@@ -20,7 +20,7 @@ conda activate deformable_gaussian_env
 
 
 # python train.py -s path/to/your/d-nerf/dataset -m output/exp-name --eval --is_blender
-python train.py -s /data/scratch/acw773/HO3D_v2/train/ABF10 -m output/ho3d/test --eval --iterations 40000
+python train.py -s /data/scratch/acw773/HO3D_v2/train/ABF10 -m output/ho3d/check-need-delete --eval --iterations 40000
 
 
 # python render.py -m output/ho3d/test --mode render
