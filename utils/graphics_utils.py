@@ -20,6 +20,11 @@ class BasicPointCloud(NamedTuple):
     colors: np.array
     normals: np.array
 
+class HOIPointCloud(NamedTuple):
+    points: np.array
+    colors: np.array
+    normals: np.array
+    labels: np.array
 
 def geom_transform_points(points, transf_matrix):
     P, _ = points.shape

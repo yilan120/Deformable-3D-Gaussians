@@ -1,0 +1,8 @@
+Variable OMP_NUM_THREADS has been set to 12
+Traceback (most recent call last):
+  File "train_HOI_nomutual.py", line 17, in <module>
+    from gaussian_renderer import render, network_gui
+  File "/data/home/acw773/Deformable-3D-Gaussians/gaussian_renderer/__init__.py", line 132
+    print("hand_means3D:{}".)
+                            ^
+SyntaxError: invalid syntax

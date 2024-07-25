@@ -11,6 +11,7 @@
 
 import os
 import sys
+import cv2
 from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -20,14 +21,18 @@ import numpy as np
 import json
 import imageio
 import torchvision
+import pickle
 from glob import glob
 import cv2 as cv
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
-from scene.gaussian_model import BasicPointCloud
+from scene.gaussian_model import BasicPointCloud, HOIPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
 from torchvision.transforms import ToTensor
+from utils.mano_utils import forwardKinematics, project_3D_points, showHandJoints, apply_global_tfm_to_camera, apply_external_transformations
+
+from mano.mano_numpy import MANO
 
 
 class CameraInfo(NamedTuple):
@@ -45,13 +50,49 @@ class CameraInfo(NamedTuple):
     fid: float
     depth: Optional[np.array] = None
 
+class CameraInfo_HOI(NamedTuple):
+    uid: int
+    pose_id: int
+    R: np.array
+    T: np.array
+    K: np.array
+    FovY: np.array
+    FovX: np.array
+    image: np.array
+    image_hand: np.array
+    image_obj: np.array
+    hand_mask: np.array
+    obj_mask: np.array
+    image_path: str
+    image_name: str
+    bkgd_mask: np.array
+    bound_mask: np.array
+    width: int
+    height: int
+    fid: float
+    smpl_param: dict
+    world_vertex: np.array
+    world_bound: np.array
+    big_pose_smpl_param: dict
+    big_pose_world_vertex: np.array
+    big_pose_world_bound: np.array
+    depth: Optional[np.array] = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
     test_cameras: list
     nerf_normalization: dict
-    ply_path: str
+    # ply_path: str
+    ply_path: list
+
+class SceneInfo_HOI(NamedTuple):
+    point_cloud: HOIPointCloud
+    train_cameras: list
+    test_cameras: list
+    nerf_normalization: dict
+    # ply_path: str
+    ply_path: list
 
 
 def load_K_Rt_from_P(filename, P=None):
@@ -100,6 +141,136 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
+def readHOICameras(cam_extrinsics, cam_intrinsics, images_folder):
+    cam_infos = []
+    num_frames = len(cam_extrinsics)
+    mano_model = MANO(left='right', model_dir='mano/models')
+
+    # SMPL in canonical space
+    big_pose_mano_param = {}
+    big_pose_mano_param['R'] = np.eye(3).astype(np.float32)
+    big_pose_mano_param['Th'] = np.zeros((1,3)).astype(np.float32)
+    big_pose_mano_param['shapes'] = np.zeros((1,10)).astype(np.float32)
+    big_pose_mano_param['poses'] = np.zeros((1,48)).astype(np.float32)
+
+    _, big_pose_xyz_cam_openGL = forwardKinematics(big_pose_mano_param['poses'], big_pose_mano_param['Th'], big_pose_mano_param['shapes'])
+    big_pose_xyz = big_pose_xyz_cam_openGL.r
+    big_pose_min_xyz = np.min(big_pose_xyz, axis=0)
+    big_pose_max_xyz = np.max(big_pose_xyz, axis=0)
+    big_pose_min_xyz -= 0.05
+    big_pose_max_xyz += 0.05
+    big_pose_world_bound = np.stack([big_pose_min_xyz, big_pose_max_xyz], axis=0)
+
+    for idx, key in enumerate(cam_extrinsics):
+        sys.stdout.write('\r')
+        sys.stdout.write(
+            "Reading camera {}/{}".format(idx + 1, len(cam_extrinsics)))
+        sys.stdout.flush()
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        uid = intr.id
+
+        c2w_R = qvec2rotmat(extr.qvec)
+        c2w_R = np.array(c2w_R)
+        c2w_T = np.array(extr.tvec).reshape(3, 1)
+        c2w = np.eye(4)
+        c2w[:3, :3] = c2w_R
+        c2w[:3, 3:4] = c2w_T
+
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3,:3])
+        T = w2c[:3, 3]
+
+        if intr.model=="SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model=="PINHOLE":
+            # TODO: check if this is correct
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        K = np.array([[focal_length_x, 0, intr.params[2]], [0, focal_length_x, intr.params[3]], [0, 0, 1]]).astype('float32')
+
+        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(image_path).split(".")[0]
+        I_image = Image.open(image_path)
+        image = ToTensor()(I_image)
+        mask_path = image_path.replace("HO3D_v2", "HO3D_v2_Segmentations_rendered").replace("images", "no_sam_seg").replace(".png", ".jpg")
+        mask_hand_path = mask_path.replace("no_sam_seg", "hand_seg")
+        mask_obj_path = mask_path.replace("no_sam_seg", "object_seg")
+        I_mask = Image.open(mask_path)
+        # import ipdb; ipdb.set_trace()
+        I_hand_mask = Image.open(mask_hand_path)
+        I_obj_mask = Image.open(mask_obj_path)
+        single_channel_mask = I_mask.convert("L")
+        # single_channel_mask_hand = I_hand_mask.convert("L")
+        # single_channel_mask_obj = I_obj_mask.convert("L")
+        tensor_single_channel_mask = ToTensor()(I_mask.convert("L"))
+        tensor_single_channel_mask_hand = ToTensor()(I_hand_mask.convert("L"))
+        tensor_single_channel_mask_obj = ToTensor()(I_obj_mask.convert("L"))
+        seg_image = torchvision.transforms.ToPILImage()(image * tensor_single_channel_mask)
+        seg_hand_image = torchvision.transforms.ToPILImage()(image * tensor_single_channel_mask_hand)
+        seg_obj_image = torchvision.transforms.ToPILImage()(image * tensor_single_channel_mask_obj)
+        mask_hand = tensor_single_channel_mask_hand.unsqueeze(0)[:, :1, :, :]
+        mask_obj = tensor_single_channel_mask_obj.unsqueeze(0)[:, :1, :, :]
+
+
+        meta_pth = image_path.replace("images", "meta").replace(".png", ".pkl")
+        with open(meta_pth, 'rb') as f:
+            meta_data = pickle.load(f)
+        handpose = meta_data['handPose'].astype('float32')
+        handshape = meta_data['handBeta'].astype('float32')
+        handTrans = meta_data['handTrans'].astype('float32')
+
+        smpl_param = {}
+        B = np.array([[1., 0., 0.], [0, -1., 0.], [0., 0., -1.]], dtype=np.float32)
+        smpl_E = apply_global_tfm_to_camera(c2w, handpose[:3], meta_data['handTrans'], B)
+        smpl_param['R'] = np.transpose(smpl_E[:3,:3].astype(np.float32))
+        smpl_param['Th'] = smpl_E[:3,3].astype(np.float32)
+        smpl_param['shapes'] = handshape.reshape(1,10)
+        wrist_rot, _ = cv2.Rodrigues(np.transpose(smpl_param['R']))
+
+        _, xyz_openGL = forwardKinematics(handpose, handTrans, handshape)
+        B = np.array([[1., 0., 0.], [0, -1., 0.], [0., 0., -1.]], dtype=np.float32)
+        xyz_cam = np.matmul(xyz_openGL, B.T)
+        xyz = np.matmul(xyz_cam, np.transpose(c2w_R)) + c2w_T.reshape(3)
+
+        handpose[:3] = wrist_rot.reshape(3,)
+        smpl_param['poses'] = handpose.reshape(1,48)
+        
+        min_xyz = np.min(xyz, axis=0)
+        max_xyz = np.max(xyz, axis=0)
+        min_xyz -= 0.05
+        max_xyz += 0.05
+        world_bound = np.stack([min_xyz, max_xyz], axis=0)
+
+        bound_mask = get_bound_2d_mask(world_bound, K, w2c[:3], height, width)
+        bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
+        bound_mask.save("/data/home/acw773/GauHuman/img1.png","PNG")
+        bkgd_mask = single_channel_mask
+
+        pose_index = 1
+
+        cam_info = CameraInfo_HOI(uid=uid, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=seg_image,
+                                  image_hand=seg_hand_image, image_obj=seg_obj_image, hand_mask=mask_hand, obj_mask=mask_obj,
+                                  image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, bound_mask=bound_mask,
+                                  width=width, height=height, fid=pose_index,
+                                  smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound,
+                                  big_pose_smpl_param=big_pose_mano_param, big_pose_world_vertex=big_pose_xyz, 
+                                  big_pose_world_bound=big_pose_world_bound)
+        cam_infos.append(cam_info)
+    sys.stdout.write('\n')
+    # import ipdb; ipdb.set_trace()
+    return cam_infos
+
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
@@ -124,6 +295,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         c2w = np.eye(4)
         c2w[:3, :3] = c2w_R
         c2w[:3, 3:4] = c2w_T
+
         w2c = np.linalg.inv(c2w)
         R = np.transpose(w2c[:3,:3])
         T = w2c[:3, 3]
@@ -161,6 +333,29 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
+def fetchPly_HOI(path_hand, path_obj):
+    plydata_hand = PlyData.read(path_hand)
+    vertices_hand = plydata_hand['vertex']
+    hand_num = len(vertices_hand['x'])
+    positions_hand = np.vstack([vertices_hand['x'], vertices_hand['y'], vertices_hand['z']]).T
+    colors_hand = np.vstack([vertices_hand['red'], vertices_hand['green'],
+                       vertices_hand['blue']]).T / 255.0
+    normals_hand = np.vstack([vertices_hand['nx'], vertices_hand['ny'], vertices_hand['nz']]).T
+
+    plydata_obj = PlyData.read(path_obj)
+    vertices_obj = plydata_obj['vertex']
+    obj_num = len(vertices_obj['x'])
+    positions_obj = np.vstack([vertices_obj['x'], vertices_obj['y'], vertices_obj['z']]).T
+    colors_obj = np.vstack([vertices_obj['red'], vertices_obj['green'],
+                       vertices_obj['blue']]).T / 255.0
+    normals_obj = np.vstack([vertices_obj['nx'], vertices_obj['ny'], vertices_obj['nz']]).T
+
+    ho_class = np.concatenate((np.ones((hand_num)), np.zeros((obj_num))))
+    positions = np.concatenate((positions_hand, positions_obj))
+    colors = np.concatenate((colors_hand, colors_obj))
+    normals = np.concatenate((normals_hand, normals_obj))
+    return HOIPointCloud(points=positions, colors=colors, normals=normals, labels=ho_class)
+
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -188,6 +383,67 @@ def storePly(path, xyz, rgb):
     vertex_element = PlyElement.describe(elements, 'vertex')
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
+
+
+def readHOISceneInfo(path, images, eval, llffhold=8):
+    try:
+        cameras_extrinsic_file = os.path.join(path, "hand_obj_full/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, "hand_obj_full/0", "cameras.bin")
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    except:
+        cameras_extrinsic_file = os.path.join(path, "hand_obj_full/0", "images.txt")
+        cameras_intrinsic_file = os.path.join(path, "hand_obj_full/0", "cameras.txt")
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    
+    reading_dir = "images" if images == None else images
+    cam_infos_unsorted = readHOICameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
+                                        images_folder=os.path.join(path, reading_dir))
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    hand_ply_path = os.path.join(path, "hand_obj_full/0/points3D_hand.ply")
+    hand_bin_path = os.path.join(path, "hand_obj_full/0/points3D_hand.bin")
+    hand_txt_path = os.path.join(path, "hand_obj_full/0/points3D_hand.txt")
+
+    obj_ply_path = os.path.join(path, "hand_obj_full/0/points3D_obj.ply")
+    obj_bin_path = os.path.join(path, "hand_obj_full/0/points3D_obj.bin")
+    obj_txt_path = os.path.join(path, "hand_obj_full/0/points3D_obj.txt")
+
+    if not os.path.exists(hand_ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            hand_xyz, hand_rgb, _ = read_points3D_binary(hand_bin_path)
+            obj_xyz, obj_rgb, _ = read_points3D_binary(obj_bin_path)
+        except:
+            hand_xyz, hand_rgb, _ = read_points3D_text(hand_txt_path)
+            obj_xyz, obj_rgb, _ = read_points3D_text(obj_txt_path)
+        storePly(hand_ply_path, hand_xyz, hand_rgb)
+    try:
+        # TODO
+        # import ipdb; ipdb.set_trace()
+        pcd = fetchPly_HOI(hand_ply_path, obj_ply_path)
+        ply_path = [hand_ply_path, obj_ply_path]
+    except:
+        pcd = None
+
+    scene_info = SceneInfo_HOI(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
 
 
 def readColmapSceneInfo(path, images, eval, llffhold=8):
@@ -617,8 +873,48 @@ def readPlenopticVideoDataset(path, eval, num_images, hold_id=[0]):
                            ply_path=ply_path)
     return scene_info
 
+def get_bound_corners(bounds):
+    min_x, min_y, min_z = bounds[0]
+    max_x, max_y, max_z = bounds[1]
+    corners_3d = np.array([
+        [min_x, min_y, min_z],
+        [min_x, min_y, max_z],
+        [min_x, max_y, min_z],
+        [min_x, max_y, max_z],
+        [max_x, min_y, min_z],
+        [max_x, min_y, max_z],
+        [max_x, max_y, min_z],
+        [max_x, max_y, max_z],
+    ])
+    return corners_3d
+
+def project(xyz, K, RT):
+    """
+    xyz: [N, 3]
+    K: [3, 3]
+    RT: [3, 4]
+    """
+    xyz = np.dot(xyz, RT[:, :3].T) + RT[:, 3:].T
+    xyz = np.dot(xyz, K.T)
+    xy = xyz[:, :2] / xyz[:, 2:]
+    return xy
+
+def get_bound_2d_mask(bounds, K, pose, H, W):
+    corners_3d = get_bound_corners(bounds)
+    corners_2d = project(corners_3d, K, pose)
+    corners_2d = np.round(corners_2d).astype(int)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(mask, [corners_2d[[0, 1, 3, 2, 0]]], 1)
+    cv2.fillPoly(mask, [corners_2d[[4, 5, 7, 6, 4]]], 1) # 4,5,7,6,4
+    cv2.fillPoly(mask, [corners_2d[[0, 1, 5, 4, 0]]], 1)
+    cv2.fillPoly(mask, [corners_2d[[2, 3, 7, 6, 2]]], 1)
+    cv2.fillPoly(mask, [corners_2d[[0, 2, 6, 4, 0]]], 1)
+    cv2.fillPoly(mask, [corners_2d[[1, 3, 7, 5, 1]]], 1)
+    return mask
+
 
 sceneLoadTypeCallbacks = {
+    "HOI": readHOISceneInfo,
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
     "Blender": readNerfSyntheticInfo,  # D-NeRF dataset [https://drive.google.com/file/d/1uHVyApwqugXTFuIRRlE4abTW8_rrVeIK/view?usp=sharing]
     "DTU": readNeuSDTUInfo,  # DTU dataset used in Tensor4D [https://github.com/DSaurus/Tensor4D]

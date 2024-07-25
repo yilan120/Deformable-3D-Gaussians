@@ -84,7 +84,6 @@ def evaluate(model_paths):
                 # renders, gts, image_names = readImages(renders_dir, gt_dir)
                 renders, gts, masks, image_names = readImages_mask(renders_dir, gt_dir, mask_dir)
                 
-
                 ssims = []
                 psnrs = []
                 lpipss = []

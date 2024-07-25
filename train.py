@@ -105,6 +105,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+
+        if iteration > 38000:
+            torchvision.utils.save_image(image, "test/D3DGS/iter_{}_image.png".format(iteration))
         # import ipdb; ipdb.set_trace()
         # torchvision.utils.save_image(image, "test/iter_{}_image.png".format(iteration))
         # torchvision.utils.save_image(gt_image, "test/iter_{}_gt_image.png".format(iteration))
